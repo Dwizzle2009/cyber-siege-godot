@@ -2,18 +2,36 @@ extends Node
 ## The Aeon SDK for Godot 4 (autoload "Aeon"). Mirrors libaeon's contract in GDScript.
 ##
 ## Reads the environment the console provides at launch (AEON_SDK, AEON_API_URL, AEON_SESSION,
-## AEON_SKU, AEON_PLAYER_ID, AEON_LANG). Outside Aeon every call succeeds silently and
-## is_on_aeon() is false, so the game runs unchanged in the editor and on a developer's desktop.
+## AEON_SKU, AEON_PLAYER_ID, AEON_LANG, and since 1.1 AEON_REFRESH_HZ, AEON_VRR, AEON_OUTPUT,
+## AEON_STATE). Outside Aeon every call succeeds silently and is_on_aeon() is false, so the game
+## runs unchanged in the editor and on a developer's desktop.
 ## Reports (unlocks, progress, scores, events) are queued, retried with backoff, and kept in
 ## user://aeon_queue.jsonl across launches if the network is down. Nothing here blocks the game.
+## 1.1: console events (guide_opened/guide_closed, suspended/resumed) come from a small file the
+## shell rewrites (AEON_STATE), polled ten times a second; player carries avatar_color and
+## banner_color for in-game display; display() says what the console launched the game on.
 
-const SDK_VERSION := "1.0.0"
+const SDK_VERSION := "1.2.0"
 
 signal leaderboard_received(category: String, entries: Array, my_rank: int, my_score: int, has_me: bool)
 signal purchase_result(sku: String, completed: bool)
+## The Guide now covers the game: pause, mute, stop the clock.
+signal guide_opened
+## Back to the game.
+signal guide_closed
+## The console went to rest. The process was frozen, so this arrives together with resumed.
+signal suspended
+## The console woke: reset timers, re-check anything time-based.
+signal resumed
 
 var on_aeon: bool = false
-var player := { "id": "", "gamertag": "Player", "lang": "en" }
+var player := { "id": "", "gamertag": "Player", "lang": "en", "avatar_color": "#6366f1", "banner_color": "#0ea5e9", "avatar_url": "", "sandbox": false }
+var _display := { "refresh_hz": 0, "vrr": false, "output": "", "prefer": "" }   # 1.2: prefer = "" | "performance" | "quality"
+var _state_path := ""
+var _state_seq := -1
+var _state_next_poll := 0
+var _guide_open := false
+var _resumes := 0
 var _api := ""
 var _token := ""
 var _sku := ""
@@ -39,6 +57,13 @@ func _ready() -> void:
 	player["id"] = OS.get_environment("AEON_PLAYER_ID")
 	var lang := OS.get_environment("AEON_LANG")
 	if lang != "": player["lang"] = lang
+	var hz := OS.get_environment("AEON_REFRESH_HZ")
+	if hz != "": _display["refresh_hz"] = int(round(float(hz)))
+	_display["vrr"] = OS.get_environment("AEON_VRR") == "1"
+	_display["output"] = OS.get_environment("AEON_OUTPUT")
+	_display["prefer"] = OS.get_environment("AEON_PREFER")   # 1.2: the player's Settings > Performance > Game preset
+	_state_path = OS.get_environment("AEON_STATE")
+	if _state_path != "": _poll_state(false)   # baseline, no signals
 	_load_queue()
 	# who's playing, what they own -- non-durable, answered via the normal queue
 	_enqueue({ "k": "me", "path": "/sdk/me", "method": HTTPClient.METHOD_GET, "body": "", "durable": false })
@@ -49,6 +74,37 @@ func is_on_aeon() -> bool:
 
 func sdk_version() -> String:
 	return SDK_VERSION
+
+## True while the Guide covers the game (false off-Aeon).
+func is_guide_open() -> bool:
+	return _guide_open
+
+## What the console launched the game on: { refresh_hz, vrr, output, prefer }. Zeros off-Aeon.
+## prefer is the player's console-wide game preset: "" (game decides), "performance" (frame rate first:
+## lower render scale, 120 or a steady 60) or "quality" (resolution and effects first; 30 or 60 is fine).
+## Honour it as the default of your own graphics menu; the player can still change it in-game.
+func display() -> Dictionary:
+	return _display.duplicate()
+
+## 1.2: one call that applies the preset for a typical 3D game -- render scale and a frame cap from the
+## refresh rate -- and returns what it chose. Call it once at startup, or skip it and read display() yourself.
+func apply_preset(perf_scale: float = 0.67, quality_scale: float = 1.0) -> Dictionary:
+	var d := display()
+	var hz: int = d["refresh_hz"]
+	var out := { "prefer": d["prefer"], "scale": 1.0, "max_fps": 0 }
+	if d["prefer"] == "performance":
+		out["scale"] = perf_scale
+		out["max_fps"] = hz if hz > 0 else 0
+	elif d["prefer"] == "quality":
+		out["scale"] = quality_scale
+		out["max_fps"] = 60 if hz >= 60 else hz
+	else:
+		return out
+	var vp := get_tree().root
+	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR2 if out["scale"] < 1.0 else Viewport.SCALING_3D_MODE_BILINEAR
+	vp.scaling_3d_scale = out["scale"]
+	Engine.max_fps = out["max_fps"]
+	return out
 
 # ---------------- public API ----------------
 
@@ -99,8 +155,36 @@ func _enqueue(job: Dictionary) -> void:
 	_pump()
 
 func _process(_dt: float) -> void:
+	if on_aeon and _state_path != "" and Time.get_ticks_msec() >= _state_next_poll:
+		_state_next_poll = Time.get_ticks_msec() + 100
+		_poll_state(true)
 	if on_aeon and not _busy and not _queue.is_empty():
 		_pump()
+
+# ---------------- console events (AEON_STATE) ----------------
+
+# The file is a few bytes; reading it ten times a second costs nothing, and its "seq" catches two changes
+# inside one second where a modification time (seconds) would not.
+func _poll_state(emit: bool) -> void:
+	var f := FileAccess.open(_state_path, FileAccess.READ)
+	if f == null: return
+	var d = JSON.parse_string(f.get_as_text())
+	f.close()
+	if not (d is Dictionary): return
+	var seq: int = int(d.get("seq", 0))
+	if seq == _state_seq: return
+	_state_seq = seq
+	var guide: bool = bool(d.get("guide", false))
+	var resumes: int = int(d.get("resumes", _resumes))
+	if emit:
+		if resumes != _resumes:
+			suspended.emit()
+			resumed.emit()
+		if guide != _guide_open:
+			if guide: guide_opened.emit()
+			else: guide_closed.emit()
+	_guide_open = guide
+	_resumes = resumes
 
 func _pump() -> void:
 	if _busy or _queue.is_empty(): return
@@ -140,6 +224,12 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			if code == 200 and data is Dictionary:
 				player["gamertag"] = data.get("gamertag", player["gamertag"])
 				player["id"] = data.get("player_id", player["id"])
+				var ac = data.get("avatar_color", "")
+				if ac is String and ac.length() == 7: player["avatar_color"] = ac
+				var bc = data.get("banner_color", "")
+				if bc is String and bc.length() == 7: player["banner_color"] = bc
+				player["avatar_url"] = String(data.get("avatar_url", ""))
+				player["sandbox"] = bool(data.get("sandbox", false))
 		"ent":
 			if code == 200 and data is Dictionary:
 				_owned.clear()
@@ -158,6 +248,7 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 			leaderboard_received.emit(j.get("category", ""), entries, my_rank, my_score, has_me)
 		"purchase":
 			if code == 200 and data is Dictionary and data.get("status") == "completed":
+				_enqueue({ "k": "ent", "path": "/sdk/entitlements", "method": HTTPClient.METHOD_GET, "body": "", "durable": false })   # 1.1.1: owns() turns true
 				purchase_result.emit(j.get("sku", ""), true)
 			elif code == 200 and data is Dictionary and data.has("id"):
 				_enqueue({ "k": "purchase_poll", "path": "/sdk/purchase/%s" % data["id"], "method": HTTPClient.METHOD_GET,
@@ -171,6 +262,8 @@ func _on_request_completed(result: int, code: int, _headers: PackedStringArray, 
 				j.next_at = Time.get_unix_time_from_system() + 2.0
 				_queue.append(j)
 			else:
+				if st == "completed":
+					_enqueue({ "k": "ent", "path": "/sdk/entitlements", "method": HTTPClient.METHOD_GET, "body": "", "durable": false })   # 1.1.1
 				purchase_result.emit(j.get("sku", ""), st == "completed")
 	_pump()
 

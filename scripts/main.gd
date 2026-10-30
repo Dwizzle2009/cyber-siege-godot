@@ -24,6 +24,10 @@ func _ready() -> void:
 	spawn_timer.process_mode = Node.PROCESS_MODE_PAUSABLE
 
 	randomize()
+	# The player's console-wide game preset (Settings > Performance). Performance: render at 67% with FSR 2
+	# and run at the display's refresh rate; Quality: full resolution at 60. "Game decides" leaves Godot's defaults.
+	var preset := Aeon.apply_preset()
+	if preset["prefer"] != "": print("[CyberSiege] preset %s -> scale %.2f, max fps %d" % [preset["prefer"], preset["scale"], preset["max_fps"]])
 	spawn_timer.timeout.connect(_spawn_enemy)
 	player.health_changed.connect(_on_health_changed)
 	player.died.connect(_on_player_died)
