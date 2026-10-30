@@ -82,7 +82,7 @@ func is_guide_open() -> bool:
 ## What the console launched the game on: { refresh_hz, vrr, output, prefer }. Zeros off-Aeon.
 ## prefer is the player's console-wide game preset: "" (game decides), "performance" (frame rate first:
 ## lower render scale, 120 or a steady 60) or "quality" (resolution and effects first; 30 or 60 is fine).
-## Honour it as the default of your own graphics menu; the player can still change it in-game.
+## Honor it as the default of your own graphics menu; the player can still change it in-game.
 func display() -> Dictionary:
 	return _display.duplicate()
 
